@@ -1,6 +1,11 @@
 name: Build polaris KernelSU Next kernel
 on:
   workflow_dispatch:
+    inputs:
+      stock_boot_sha256:
+        description: '可选：stock/boot.img 期望的 SHA256（留空则只记录实际值；填写则强制校验）'
+        required: false
+        type: string
 permissions:
   contents: read
 concurrency:
@@ -15,12 +20,44 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          lfs: true
+
       - name: Install host build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential bc bison flex libssl-dev libelf-dev python3 curl bzip2 xz-utils
+
       - name: Test compatibility error paths
         run: bash build-support/run-tests.sh
+
+      - name: Validate repack helper (local-only, never uploads stock boot)
+        run: |
+          test -f build-support/repack-boot.py
+          python3 - <<'PY'
+          import ast
+          import pathlib
+          src = pathlib.Path('build-support/repack-boot.py').read_text(encoding='utf-8')
+          ast.parse(src)
+          print('repack-boot.py syntax OK')
+          PY
+
+      - name: Verify stock/boot.img
+        env:
+          EXPECTED_SHA256: ${{ inputs.stock_boot_sha256 }}
+        run: |
+          if [ ! -f stock/boot.img ]; then
+            echo "::error::stock/boot.img not found. Commit it via Git LFS or plain git before running."
+            exit 1
+          fi
+          actual=$(sha256sum stock/boot.img | awk '{print $1}')
+          echo "stock/boot.img SHA256: $actual"
+          echo "stock/boot.img size: $(stat -c%s stock/boot.img) bytes"
+          echo "STOCK_SHA256=$actual" >> "$GITHUB_ENV"
+          if [ -n "$EXPECTED_SHA256" ] && [ "$actual" != "$EXPECTED_SHA256" ]; then
+            echo "::error::SHA256 mismatch: expected $EXPECTED_SHA256, got $actual"
+            exit 1
+          fi
+
       - name: Build and verify KSU kernel
         env:
           JOBS: '2'
@@ -28,16 +65,68 @@ jobs:
           set -o pipefail
           mkdir -p dist
           bash build-support/build.sh 2>&1 | tee dist/build.log
+
+      - name: Repack boot.img with KSU kernel
+        run: |
+          set -euo pipefail
+          python3 build-support/repack-boot.py \
+            --stock stock/boot.img \
+            --kernel dist/Image.gz-dtb \
+            --output dist/polaris-ksunext-boot.img
+          test -s dist/polaris-ksunext-boot.img
+          echo "Generated boot.img size: $(stat -c%s dist/polaris-ksunext-boot.img) bytes"
+          sha256sum dist/polaris-ksunext-boot.img | tee /tmp/boot.sha
+          # 把 boot.img 的校验和追加到 SHA256SUMS
+          cat /tmp/boot.sha | sed 's# dist/# #' >> /dev/null
+          ( cd dist && sha256sum polaris-ksunext-boot.img >> SHA256SUMS )
+
+      - name: Emit repack metadata
+        env:
+          STOCK_SHA256: ${{ env.STOCK_SHA256 }}
+        run: |
+          BOOT_SHA=$(awk '{print $1}' /tmp/boot.sha)
+          BOOT_SIZE=$(stat -c%s dist/polaris-ksunext-boot.img)
+          cat > dist/REPACK.md <<EOF
+          # polaris KSU Next boot.img
+
+          本 artifact 中的 \`polaris-ksunext-boot.img\` 由 CI 从仓库内 \`stock/boot.img\` 与构建出的 \`Image.gz-dtb\` 自动打包生成，包含原厂 ramdisk 与启动参数。
+
+          | 项 | 值 |
+          |---|---|
+          | stock/boot.img SHA256 | \`${STOCK_SHA256}\` |
+          | polaris-ksunext-boot.img SHA256 | \`${BOOT_SHA}\` |
+          | polaris-ksunext-boot.img 大小 | ${BOOT_SIZE} bytes |
+
+          ## 刷入
+
+          \`\`\`bash
+          fastboot flash boot polaris-ksunext-boot.img
+          \`\`\`
+
+          需要已解锁 bootloader。本项目不对其他 ROM 或其他 boot 格式提供兼容保证。
+          不要把 SSH 私钥、ADB 报告、个人数据或原厂 \`.ko\` 加入仓库。
+          EOF
+          cat dist/REPACK.md
+
       - name: Check public artifact contents
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          required = {'Image.gz-dtb', 'Module.symvers', 'kernel.config', 'SHA256SUMS', 'validation.json', 'build-manifest.json', 'provenance.json', 'COPYING', 'build.log'}
+          required = {
+              'Image.gz-dtb', 'Module.symvers', 'kernel.config', 'SHA256SUMS',
+              'validation.json', 'build-manifest.json', 'provenance.json',
+              'COPYING', 'build.log', 'REPACK.md',
+              'polaris-ksunext-boot.img',
+          }
           files = {p.name for p in Path('dist').iterdir() if p.is_file()}
           assert files == required, f'Unexpected or missing artifacts: {files ^ required}'
           assert all(p.is_file() and not p.is_symlink() for p in Path('dist').iterdir())
+          boot = Path('dist/polaris-ksunext-boot.img')
+          assert boot.stat().st_size > 0, 'boot.img is empty'
+          print(f'boot.img present: {boot.stat().st_size} bytes')
           PY
-      - name: Upload kernel and build evidence
+
+      - name: Upload kernel and repacked boot.img
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: polaris-ksunext-${{ github.sha }}
