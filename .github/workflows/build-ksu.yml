@@ -30,7 +30,7 @@ jobs:
       - name: Test compatibility error paths
         run: bash build-support/run-tests.sh
 
-      - name: Validate repack helper (local-only, never uploads stock boot)
+      - name: Validate repack helper
         run: |
           test -f build-support/repack-boot.py
           python3 - <<'PY'
@@ -66,7 +66,7 @@ jobs:
           mkdir -p dist
           bash build-support/build.sh 2>&1 | tee dist/build.log
 
-      - name: Repack boot.img with KSU kernel
+      - name: Repack boot.img and drop side-car files
         run: |
           set -euo pipefail
           python3 build-support/repack-boot.py \
@@ -75,10 +75,27 @@ jobs:
             --output dist/polaris-ksunext-boot.img
           test -s dist/polaris-ksunext-boot.img
           echo "Generated boot.img size: $(stat -c%s dist/polaris-ksunext-boot.img) bytes"
+
+          # 清理打包器产生的 .json 及其他白名单外文件，只保留最终 11 个产物
+          python3 - <<'PY'
+          from pathlib import Path
+          allowed = {
+              'Image.gz-dtb', 'Module.symvers', 'kernel.config', 'SHA256SUMS',
+              'validation.json', 'build-manifest.json', 'provenance.json',
+              'COPYING', 'build.log', 'REPACK.md',
+              'polaris-ksunext-boot.img',
+          }
+          for p in sorted(Path('dist').iterdir()):
+              if p.is_file() and p.name not in allowed:
+                  print(f'removing side-car: {p.name}')
+                  p.unlink()
+          PY
+
           sha256sum dist/polaris-ksunext-boot.img | tee /tmp/boot.sha
-          # 把 boot.img 的校验和追加到 SHA256SUMS
-          cat /tmp/boot.sha | sed 's# dist/# #' >> /dev/null
-          ( cd dist && sha256sum polaris-ksunext-boot.img >> SHA256SUMS )
+          # 追加到 SHA256SUMS，若已存在则跳过，避免重复行
+          if ! grep -q 'polaris-ksunext-boot.img' dist/SHA256SUMS 2>/dev/null; then
+            ( cd dist && sha256sum polaris-ksunext-boot.img >> SHA256SUMS )
+          fi
 
       - name: Emit repack metadata
         env:
@@ -89,7 +106,7 @@ jobs:
           cat > dist/REPACK.md <<EOF
           # polaris KSU Next boot.img
 
-          本 artifact 中的 \`polaris-ksunext-boot.img\` 由 CI 从仓库内 \`stock/boot.img\` 与构建出的 \`Image.gz-dtb\` 自动打包生成，包含原厂 ramdisk 与启动参数。
+          本 artifact 中的 \`polaris-ksunext-boot.img\` 由 CI 从仓库内 \`stock/boot.img\` 与构建出的 \`Image.gz-dtb\` 自动打包生成，包含原厂 ramdisk 与启动参数。打包器产生的元数据/中间文件已在打包后清理，仅保留最终镜像。
 
           | 项 | 值 |
           |---|---|
